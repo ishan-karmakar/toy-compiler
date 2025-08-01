@@ -1,4 +1,7 @@
-#include <lexer.hpp>
+#include "lexer.hpp"
+
+std::string identifier_str;
+double num_val;
 
 int gettok()
 {

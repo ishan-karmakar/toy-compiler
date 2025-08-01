@@ -10,7 +10,7 @@ enum Token
     Number = -5
 };
 
-static std::string identifier_str;
-static double num_val;
+extern std::string identifier_str;
+extern double num_val;
 
 int gettok();
