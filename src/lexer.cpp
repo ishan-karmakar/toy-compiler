@@ -1,4 +1,5 @@
 #include "lexer.hpp"
+#include <iostream>
 
 std::string identifier_str;
 double num_val;
@@ -8,7 +9,6 @@ int gettok()
     static char last_char = ' ';
     while (isspace(last_char))
         last_char = getchar();
-
     if (isalpha(last_char))
     {
         identifier_str = last_char;

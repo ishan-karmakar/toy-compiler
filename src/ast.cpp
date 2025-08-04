@@ -1,4 +1,16 @@
 #include <iostream>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Module.h>
+#include <llvm/Analysis/LoopAnalysisManager.h>
+#include <llvm/Analysis/CGSCCPassManager.h>
+#include <llvm/Passes/StandardInstrumentations.h>
+#include <llvm/Passes/PassBuilder.h>
+#include <llvm/IR/Verifier.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Transforms/Scalar/Reassociate.h>
+#include <llvm/Transforms/Scalar/GVN.h>
+#include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include "ast.hpp"
 #include "lexer.hpp"
 
@@ -6,6 +18,20 @@ std::unique_ptr<ExprAST> parse_expr();
 
 int cur_token;
 std::unordered_map<char, int> binop_precedence;
+
+std::unique_ptr<llvm::LLVMContext> context;
+std::unique_ptr<llvm::IRBuilder<>> builder;
+std::unique_ptr<llvm::Module> mod;
+std::unique_ptr<llvm::FunctionPassManager> FPM;
+std::unique_ptr<llvm::LoopAnalysisManager> LAM;
+std::unique_ptr<llvm::FunctionAnalysisManager> FAM;
+std::unique_ptr<llvm::CGSCCAnalysisManager> CGAM;
+std::unique_ptr<llvm::ModuleAnalysisManager> MAM;
+std::unique_ptr<llvm::PassInstrumentationCallbacks> PIC;
+std::unique_ptr<llvm::StandardInstrumentations> SI;
+
+std::unordered_map<std::string, llvm::Value *>
+    named_values;
 
 int get_next_token()
 {
@@ -32,7 +58,7 @@ std::unique_ptr<ExprAST> parse_paren_expr()
         exit(1);
     }
 
-    gettok();
+    get_next_token();
     return expr;
 }
 
@@ -40,7 +66,6 @@ std::unique_ptr<ExprAST> parse_identifier_expr()
 {
     std::string id_name = identifier_str;
     get_next_token();
-
     // Simple variable ref
     if (cur_token != '(')
         return std::make_unique<VariableExprAST>(id_name);
@@ -172,7 +197,6 @@ std::unique_ptr<FunctionAST> parse_definition()
     auto proto = parse_prototype();
     if (!proto)
         return nullptr;
-
     if (auto E = parse_expr())
         return std::make_unique<FunctionAST>(std::move(proto), std::move(E));
     return nullptr;
@@ -194,6 +218,145 @@ std::unique_ptr<FunctionAST> parse_toplevel_expr()
     return nullptr;
 }
 
+llvm::Value *NumberExprAST::codegen()
+{
+    return llvm::ConstantFP::get(*context, llvm::APFloat{val});
+}
+
+llvm::Value *VariableExprAST::codegen()
+{
+    llvm::Value *val = named_values[name];
+    if (val)
+        return val;
+    else
+    {
+        std::cerr << "Unknown variable name\n";
+        return nullptr;
+    }
+}
+
+llvm::Value *BinaryExprAST::codegen()
+{
+    llvm::Value *L = LHS->codegen();
+    llvm::Value *R = RHS->codegen();
+
+    if (!L || !R)
+        return nullptr;
+
+    switch (op)
+    {
+    case '+':
+        return builder->CreateFAdd(L, R, "add");
+    case '-':
+        return builder->CreateFSub(L, R, "sub");
+    case '*':
+        return builder->CreateFMul(L, R, "mul");
+    case '<':
+        L = builder->CreateFCmpULT(L, R, "cmplt");
+        return builder->CreateUIToFP(L, llvm::Type::getDoubleTy(*context), "bool");
+    default:
+        std::cerr << "Invalid binary operator\n";
+        return nullptr;
+    }
+}
+
+llvm::Value *CallExprAST::codegen()
+{
+    llvm::Function *callee_func = mod->getFunction(callee);
+    if (!callee_func)
+    {
+        std::cerr << "Unknown function referenced\n";
+        return nullptr;
+    }
+
+    if (callee_func->arg_size() != args.size())
+    {
+        std::cerr << "Incorrect number of args passed\n";
+        return nullptr;
+    }
+
+    std::vector<llvm::Value *> llvm_args;
+    for (const auto &arg : args)
+    {
+        llvm_args.push_back(arg->codegen());
+        if (!llvm_args.back())
+            return nullptr;
+    }
+    return builder->CreateCall(callee_func, llvm_args, "call");
+}
+
+llvm::Function *PrototypeAST::codegen()
+{
+    std::vector<llvm::Type *> doubles{args.size(), llvm::Type::getDoubleTy(*context)};
+    llvm::FunctionType *FT = llvm::FunctionType::get(llvm::Type::getDoubleTy(*context), doubles, false);
+    llvm::Function *F = llvm::Function::Create(FT, llvm::Function::ExternalLinkage, name, *mod);
+    int i = 0;
+    for (auto &arg : F->args())
+        arg.setName(args[i++]);
+    return F;
+}
+
+llvm::Function *FunctionAST::codegen()
+{
+    llvm::Function *func = mod->getFunction(proto->name);
+
+    if (!func)
+        func = proto->codegen();
+
+    if (!func)
+        return nullptr;
+
+    if (!func->empty())
+    {
+        std::cerr << "Function cannot be redefined\n";
+        return nullptr;
+    }
+
+    llvm::BasicBlock *BB = llvm::BasicBlock::Create(*context, "entry", func);
+    builder->SetInsertPoint(BB);
+
+    named_values.clear();
+    for (auto &arg : func->args())
+        named_values[std::string{arg.getName()}] = &arg;
+
+    if (llvm::Value *ret = body->codegen())
+    {
+        builder->CreateRet(ret);
+        llvm::verifyFunction(*func);
+
+        FPM->run(*func, *FAM);
+        return func;
+    }
+
+    func->eraseFromParent();
+    return nullptr;
+}
+
+void init()
+{
+    context = std::make_unique<llvm::LLVMContext>();
+    mod = std::make_unique<llvm::Module>("KaldeiscopeJIT", *context);
+    builder = std::make_unique<llvm::IRBuilder<>>(*context);
+    FPM = std::make_unique<llvm::FunctionPassManager>();
+    LAM = std::make_unique<llvm::LoopAnalysisManager>();
+    FAM = std::make_unique<llvm::FunctionAnalysisManager>();
+    CGAM = std::make_unique<llvm::CGSCCAnalysisManager>();
+    MAM = std::make_unique<llvm::ModuleAnalysisManager>();
+    PIC = std::make_unique<llvm::PassInstrumentationCallbacks>();
+    SI = std::make_unique<llvm::StandardInstrumentations>(*context, true);
+    SI->registerCallbacks(*PIC, MAM.get());
+
+    FPM->addPass(llvm::InstCombinePass{});
+    FPM->addPass(llvm::ReassociatePass{});
+    FPM->addPass(llvm::GVNPass{});
+    FPM->addPass(llvm::SimplifyCFGPass{});
+
+    llvm::PassBuilder PB;
+    PB.registerModuleAnalyses(*MAM);
+    PB.registerFunctionAnalyses(*FAM);
+    PB.crossRegisterProxies(*LAM, *FAM, *CGAM, *MAM);
+}
+
 void loop()
 {
     while (true)
@@ -201,23 +364,18 @@ void loop()
         switch (cur_token)
         {
         case Eof:
-            std::cout << "Parsing an EOF\n";
             return;
         case ';':
-            std::cout << "Parsing a top level semicolon\n";
             get_next_token();
             break;
         case Def:
-            std::cout << "Parsing a definition\n";
-            parse_definition();
+            parse_definition()->codegen()->print(llvm::outs());
             break;
         case Extern:
-            std::cout << "Parsing an extern\n";
-            parse_extern();
+            parse_extern()->codegen()->print(llvm::outs());
             break;
         default:
-            std::cout << "Parsing a top level expression\n";
-            parse_toplevel_expr();
+            parse_toplevel_expr()->codegen()->print(llvm::outs());
             break;
         }
     }
